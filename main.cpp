@@ -233,6 +233,7 @@ static bool WriteFileW(const std::wstring& path, const std::vector<BYTE>& data) 
 // Extract a zip (or jar) to destDir using tar.exe (built into Win10+)
 static bool ExtractZip(const std::wstring& zipPath, const std::wstring& destDir) {
     MakeDirRecursive(destDir);
+    // tar -xf zipPath -C destDir
     std::wstring cmd = L"tar.exe -xf \"" + zipPath + L"\" -C \"" + destDir + L"\"";
     STARTUPINFOW si={sizeof(si)}; PROCESS_INFORMATION pi={0};
     if (!CreateProcessW(NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
@@ -326,7 +327,7 @@ static bool RulesAllow(const json& lib) {
     return allow;
 }
 
-// Recursively copy all files from srcDir to dstDir
+// Recursively copy all files from srcDir to dstDir (preserving relative paths)
 static void CopyDirRecursive(const std::wstring& srcDir, const std::wstring& dstDir) {
     MakeDirRecursive(dstDir);
     WIN32_FIND_DATAW fd;
@@ -346,7 +347,7 @@ static void CopyDirRecursive(const std::wstring& srcDir, const std::wstring& dst
     FindClose(h);
 }
 
-// Install loader after vanilla is downloaded.
+// Install loader after vanilla is downloaded. Returns new version folder name.
 // loaderSel: 0=vanilla, 1=fabric, 2=forge, 3=neoforge, 4=optifine
 static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::wstring& workDir,
                           const std::wstring& customName,
@@ -356,6 +357,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
     SetStatus(L"正在安装加载器…");
 
     if (loaderSel == 1) {
+        // ---- Fabric: fetch profile JSON from fabric-meta ----
         HttpResult lr = HttpGet(L"https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader");
         if (!lr.ok) { outErr=L"获取 Fabric 列表失败: "+lr.err; return false; }
         try {
@@ -368,12 +370,14 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
             if (!pr.ok) { outErr=L"获取 Fabric profile 失败: "+pr.err; return false; }
             json prof = json::parse(std::string(pr.data.begin(), pr.data.end()));
 
+            // Read the existing vanilla version.json and merge Fabric into it
             std::wstring vjsonPath = workDir + L"\\versions\\" + mcVer + L"\\" + mcVer + L".json";
             std::ifstream vf(WToUtf8(vjsonPath), std::ios::binary);
             if (!vf) { outErr=L"找不到原版 version.json"; return false; }
             std::stringstream vss; vss << vf.rdbuf();
             json vj = json::parse(vss.str());
 
+            // prepend fabric libraries
             if (prof.contains("libraries")) {
                 json merged = json::array();
                 for (auto& lib : prof["libraries"]) merged.push_back(lib);
@@ -389,21 +393,25 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                     else for (auto& a : it.value()) vj["arguments"][it.key()].push_back(a);
                 }
             }
+            // self-contained: remove inheritsFrom, set new id
             std::wstring newId = mcVer + L"-fabric-" + loaderVer;
             if (!customName.empty()) newId = customName;
             vj.erase("inheritsFrom");
             vj["id"] = WToUtf8(newId);
 
+            // write to NEW fabric folder
             std::wstring fdir = workDir + L"\\versions\\" + newId;
             MakeDirRecursive(fdir);
             std::string s = vj.dump();
             WriteFileW(fdir+L"\\"+newId+L".json", std::vector<BYTE>(s.begin(),s.end()));
 
+            // copy vanilla jar into fabric folder
             std::wstring srcJar = workDir + L"\\versions\\" + mcVer + L"\\" + mcVer + L".jar";
             std::wstring dstJar = fdir + L"\\" + newId + L".jar";
             if (GetFileAttributesW(srcJar.c_str()) != INVALID_FILE_ATTRIBUTES)
                 CopyFileW(srcJar.c_str(), dstJar.c_str(), FALSE);
 
+            // download fabric libraries
             if (prof.contains("libraries")) {
                 int total = (int)prof["libraries"].size(), done=0;
                 for (auto& lib : prof["libraries"]) {
@@ -420,6 +428,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                         for (auto& c : grp) if (c=='.') c='/';
                         path = grp+"/"+art+"/"+ver+"/"+art+"-"+ver+".jar";
                     }
+                    // fabric libs: net.fabricmc -> fabricmc maven, rest -> Maven Central
                     std::wstring base = L"https://maven.fabricmc.net/";
                     std::string grp = name.substr(0, name.find(':'));
                     if (grp.find("net.fabricmc") != 0) base = L"https://repo1.maven.org/maven2/";
@@ -433,6 +442,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                 }
             }
             outNewVerId = newId;
+            // remove the standalone vanilla folder (fabric is self-contained now)
             {
                 std::wstring from = workDir + L"\\versions\\" + mcVer;
                 from.push_back(L'\0'); from.push_back(L'\0');
@@ -447,14 +457,19 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
     }
 
     if (loaderSel == 2 || loaderSel == 3) {
-        std::wstring listUrl;
-        if (loaderSel == 2) listUrl = L"https://bmclapi2.bangbang93.com/forge/minecraft/" + mcVer;
-        else listUrl = L"https://bmclapi2.bangbang93.com/neoforge/list/" + mcVer;
+        // ---- Forge / NeoForge: download installer.jar and extract ----
+        std::wstring listUrl, dler;
+        if (loaderSel == 2) {
+            listUrl = L"https://bmclapi2.bangbang93.com/forge/minecraft/" + mcVer;
+        } else {
+            listUrl = L"https://bmclapi2.bangbang93.com/neoforge/list/" + mcVer;
+        }
         HttpResult lr = HttpGet(listUrl);
         if (!lr.ok) { outErr=L"获取加载器列表失败: "+lr.err; return false; }
         try {
             json arr = json::parse(std::string(lr.data.begin(), lr.data.end()));
             if (!arr.is_array() || arr.empty()) { outErr=L"该 MC 版本无此加载器"; return false; }
+            // pick latest by build number
             json chosen = arr[0];
             long bestBuild = 0;
             for (auto& a : arr) {
@@ -466,14 +481,17 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
 
             std::wstring instUrl;
             if (loaderSel == 2) {
-                instUrl = L"https://maven.minecraftforge.net/net/minecraftforge/forge/"
+                // Forge: use BMCLAPI maven (WinHTTP now follows redirects manually)
+                instUrl = L"https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/"
                     + mcVer + L"-" + forgeVer + L"/forge-" + mcVer + L"-" + forgeVer + L"-installer.jar";
             } else {
+                // NeoForge: use installerPath from API
                 std::string ipath = chosen.value("installerPath", "");
                 if (ipath.empty()) { outErr=L"NeoForge 无 installer 路径"; return false; }
                 instUrl = L"https://bmclapi2.bangbang93.com" + Utf8ToW(ipath);
             }
             SetStatus(L"下载加载器安装包 "+forgeVer+L"…");
+            outErr = L"URL: " + instUrl;  // debug
             HttpResult jr = HttpGet(instUrl);
             if (!jr.ok) { outErr=L"下载安装包失败: "+jr.err+L"  URL:"+instUrl; return false; }
 
@@ -488,6 +506,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
             }
             if (!ExtractZip(tmpZip, tmpDir)) { outErr=L"解压安装包失败"; return false; }
 
+            // wait for async extract to finish (poll for version.json)
             for (int i=0; i<60; i++) {
                 if (GetFileAttributesW((tmpDir+L"\\version.json").c_str()) != INVALID_FILE_ATTRIBUTES) break;
                 Sleep(500);
@@ -496,20 +515,24 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                 outErr=L"解压超时，version.json 未出现"; return false;
             }
 
+            // copy maven/* to libraries/
             CopyDirRecursive(tmpDir+L"\\maven", workDir+L"\\libraries");
 
+            // read version.json
             std::wstring vjsonPath = tmpDir+L"\\version.json";
             std::ifstream vf(WToUtf8(vjsonPath), std::ios::binary);
             if (!vf) { outErr=L"安装包里没有 version.json"; return false; }
             std::stringstream vss; vss << vf.rdbuf();
             json vj = json::parse(vss.str());
 
+            // download all libraries declared in version.json from bmclapi maven
             if (vj.contains("libraries")) {
                 int total = (int)vj["libraries"].size(), done=0;
                 for (auto& lib : vj["libraries"]) {
                     done++;
                     if (!lib.contains("name")) continue;
                     std::string name = lib["name"];
+                    // parse group:artifact:version
                     size_t p1 = name.find(':'); size_t p2 = name.find(':', p1+1);
                     if (p1==std::string::npos||p2==std::string::npos) continue;
                     std::string grp = name.substr(0,p1);
@@ -522,12 +545,8 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                     std::replace(wpath.begin(), wpath.end(), L'/', L'\\');
                     if (GetFileAttributesW((workDir+L"\\libraries\\"+wpath).c_str()) != INVALID_FILE_ATTRIBUTES) continue;
                     SetStatus(L"[Forge libs "+std::to_wstring(done)+L"/"+std::to_wstring(total)+L"] "+wpath);
-                    std::wstring base;
-                    if (grp.find("net.minecraftforge")==0 || grp.find("cpw.mods")==0 || grp.find("net.neoforged")==0)
-                        base = L"https://maven.minecraftforge.net/";
-                    else
-                        base = L"https://repo1.maven.org/maven2/";
-                    std::wstring url = base + Utf8ToW(path);
+                    // all libraries via BMCLAPI maven (no external maven)
+                    std::wstring url = L"https://bmclapi2.bangbang93.com/maven/" + Utf8ToW(path);
                     HttpResult d = HttpGet(url);
                     if (d.ok) WriteFileW(workDir+L"\\libraries\\"+wpath, d.data);
                 }
@@ -558,6 +577,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
     }
 
     if (loaderSel == 4) {
+        // ---- OptiFine: download jar directly to libraries ----
         HttpResult lr = HttpGet(L"https://bmclapi2.bangbang93.com/optifine/"+mcVer);
         if (!lr.ok) { outErr=L"获取 OptiFine 列表失败: "+lr.err; return false; }
         try {
@@ -575,6 +595,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
             std::replace(libPath.begin(), libPath.end(), L'/', L'\\');
             WriteFileW(workDir+L"\\"+libPath, jr.data);
 
+            // create a version json that inherits vanilla and adds OptiFine lib
             std::wstring newId = mcVer+L"-OptiFine";
             if (!customName.empty()) newId = customName;
             std::wstring vdir = workDir+L"\\versions\\"+newId;
@@ -582,7 +603,7 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
             json vj;
             vj["id"] = WToUtf8(newId);
             vj["inheritsFrom"] = WToUtf8(mcVer);
-            vj["mainClass"] = "net.fabricmc.loader.impl.launch.knot.KnotClient";
+            vj["mainClass"] = "net.fabricmc.loader.impl.launch.knot.KnotClient"; // placeholder
             json libs = json::array();
             json ofLib;
             ofLib["name"] = "optifine:OptiFine:"+WToUtf8(mcVer+L"_"+type+L"_"+patch);
@@ -655,10 +676,12 @@ static DWORD WINAPI DownloadThread(LPVOID param) {
             std::string s = vj2.dump();
             WriteFileW(verDir+L"\\"+ver.id+L".json", std::vector<BYTE>(s.begin(),s.end()));
         }
+        // client jar
         if (vj2.contains("downloads") && vj2["downloads"].contains("client")) {
             std::wstring u = BmclRewrite(Utf8ToW(vj2["downloads"]["client"].value("url","")));
             if (!u.empty()) queue.push_back({u, L"versions\\"+ver.id+L"\\"+ver.id+L".jar"});
         }
+        // libraries
         if (vj2.contains("libraries")) {
             for (auto& lib : vj2["libraries"]) {
                 if (!RulesAllow(lib)) continue;
@@ -681,6 +704,7 @@ static DWORD WINAPI DownloadThread(LPVOID param) {
                 }
             }
         }
+        // asset index
         std::wstring aiId;
         if (vj2.contains("assetIndex")) {
             aiId = Utf8ToW(vj2["assetIndex"].value("id",""));
@@ -700,6 +724,7 @@ static DWORD WINAPI DownloadThread(LPVOID param) {
         for (int i=0;i<8;i++) CloseHandle(th[i]);
         DeleteCriticalSection(&ctx.mtx);
         if (g_cancel) { goto fin; }
+        // assets objects
         std::vector<DlFile> objs;
         if (!aiId.empty()) {
             std::wstring idxPath = workDir+L"\\assets\\indexes\\"+aiId+L".json";
@@ -737,6 +762,7 @@ static DWORD WINAPI DownloadThread(LPVOID param) {
     } catch (const std::exception& e) {
         ok=false; fail=Utf8ToW(std::string("解析:")+e.what());
     }
+    // Install loader on top of vanilla
     if (ok && loaderSel != 0) {
         std::wstring newVerId, loaderErr;
         if (!InstallLoader(ver.id, loaderSel, workDir, g_pendingName, newVerId, loaderErr)) {
@@ -813,12 +839,14 @@ static void DrawNavButton(LPDRAWITEMSTRUCT di) {
     FillRect(di->hDC, &di->rcItem, bg);
     DeleteObject(bg);
 
+    // accent bar on left
     if (selected) {
         RECT bar = { di->rcItem.left, di->rcItem.top+6, di->rcItem.left+4, di->rcItem.bottom-6 };
         HBRUSH ab = CreateSolidBrush(CLR_ACCENT);
         FillRect(di->hDC, &bar, ab);
         DeleteObject(ab);
     }
+    // text
     SetBkMode(di->hDC, TRANSPARENT);
     SetTextColor(di->hDC, selected ? CLR_ACCENT : CLR_TEXT);
     HFONT old = (HFONT)SelectObject(di->hDC, selected ? g_fontBold : g_fontUI);
@@ -831,7 +859,7 @@ static void DrawNavButton(LPDRAWITEMSTRUCT di) {
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        g_hMain = hWnd;
+        g_hMain = hWnd;   // ★ critical: assign early so background thread can PostMessage
         g_fontUI = CreateFontW(19,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
             DEFAULT_PITCH|FF_SWISS,L"Microsoft YaHei");
@@ -842,10 +870,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
             DEFAULT_PITCH|FF_SWISS,L"Microsoft YaHei");
 
+        // Title in sidebar
         g_hTitle = CreateWindowExW(0, L"STATIC", L"PCL DE",
             WS_CHILD|WS_VISIBLE|SS_LEFT, 20, 24, 140, 36, hWnd, (HMENU)0, g_hInst, NULL);
         SendMessage(g_hTitle, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
 
+        // Nav buttons (owner-draw)
         const wchar_t* navLabels[3] = { L"下载", L"实例管理", L"关于" };
         for (int i=0;i<3;i++) {
             g_hNav[i] = CreateWindowExW(0, L"BUTTON", navLabels[i],
@@ -853,6 +883,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                 0, 90+i*48, SIDEBAR_W, 44, hWnd, (HMENU)(ID_NAV_DOWNLOAD+i), g_hInst, NULL);
         }
 
+        // === Download page ===
         g_hLblFilter = CreateWindowExW(0, L"STATIC", L"筛选:",
             WS_CHILD|WS_VISIBLE, 20, 18, 40, 26, hWnd, (HMENU)0, g_hInst, NULL);
         g_hFilter = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -871,6 +902,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD|WS_VISIBLE, 395, 18, 55, 26, hWnd, (HMENU)0, g_hInst, NULL);
         g_hCustomName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL, 455, 15, 140, 28, hWnd, (HMENU)ID_CUSTOM_NAME, g_hInst, NULL);
+        SetWindowTextW(g_hCustomName, L"");
         g_hBtnRefresh = CreateWindowExW(0, L"BUTTON", L"刷新列表",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 400, 14, 90, 28, hWnd, (HMENU)ID_BTN_REFRESH, g_hInst, NULL);
 
@@ -897,6 +929,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hStatus = CreateWindowExW(0, L"STATIC", L"正在启动…",
             WS_CHILD|WS_VISIBLE|SS_LEFTNOWORDWRAP, 20, 530, 760, 20, hWnd, (HMENU)ID_STATUS, g_hInst, NULL);
 
+        // === Instance page ===
         g_hLstInst = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
             WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS,
             20, 18, 760, 460, hWnd, (HMENU)ID_LIST_INSTANCES, g_hInst, NULL);
@@ -916,10 +949,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"重命名",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 350, 490, 90, 30, hWnd, (HMENU)ID_BTN_RENAME, g_hInst, NULL);
 
+        // === About page ===
         {
             std::wstring about =
                 L"Plain Craft Launcher-download-Edition\n"
-                L"版本: V1.0.0\n"
+                L"版本: V1.0.1\n"
                 L"\n"
                 L"极简的Minecraft下载器及实例管理器！（豆包最有用的一次）\n"
                 L"本启动器为PCL 2.99.0关闭下载Minecraft入口而生！\n"
@@ -937,6 +971,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         SwitchPage(0);
+        // Apply UI font to all child controls
         {
             HWND child = GetWindow(hWnd, GW_CHILD);
             while (child) {
@@ -975,6 +1010,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(g_hBtnDel, rx+220, ch-65, 100, 30, TRUE);
 
         MoveWindow(g_hAboutText, rx+20, 40, rw-20, ch-60, TRUE);
+        // resize last list column to fill
         if (g_hLstVer) {
             RECT rc; GetClientRect(g_hLstVer, &rc);
             int w = rc.right - rc.left;
@@ -1115,6 +1151,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_APP_DONE: EnableWindow(g_hBtnDownload, TRUE); break;
     case WM_ERASEBKGND: {
+        // paint sidebar + content bg
         RECT rc; GetClientRect(hWnd,&rc);
         HDC hdc = (HDC)wp;
         HBRUSH bg = CreateSolidBrush(CLR_BG);
