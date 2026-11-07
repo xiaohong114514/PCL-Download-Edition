@@ -1,14 +1,13 @@
 # Plain Craft Launcher-download-Edition
 
-版本：V1.0.0
 
 极简的Minecraft下载器及实例管理器！（豆包最有用的一次）
 
-本启动器为PCL 2.99.0关闭下载Minecraft入口而生！
+本下载器为PCL 2.99.0关闭下载Minecraft入口而生！
 使用了部分PCL 2的代码！
 
 本下载器仅供下载Minecraft使用，无任何Minecraft源码，与mojang，微软和网易无关！
-如果你是下载PCL时，下载到了这个下载器，请支持PCL官方！
+如果你是下载PCL时，下载到了这个下载器，请更换PCL官方！
 
 使用了BMCLAPI（bmclapi2.bangbang93.com）！
 
