@@ -87,7 +87,7 @@ static HWND g_hCustomName=NULL, g_hLblName=NULL;
 static std::atomic<bool> g_cancel{false};
 static std::wstring g_pendingName;
 
-static HWND g_hLstInst=NULL, g_hBtnOpen=NULL, g_hBtnDel=NULL, g_hBtnRefreshInst=NULL;
+static HWND g_hLstInst=NULL, g_hBtnOpen=NULL, g_hBtnDel=NULL, g_hBtnRefreshInst=NULL, g_hBtnRename=NULL;
 static HWND g_hAboutText=NULL;
 
 static int g_currentPage = 0;
@@ -221,6 +221,16 @@ static HttpResult HttpGet(const std::wstring& url) {
     if (r.err.empty()) r.err = L"重定向过多";
     return r;
 }
+// Try a list of candidate URLs in order; return first success. Keep last error on failure.
+static HttpResult HttpGetMulti(const std::vector<std::wstring>& urls) {
+    HttpResult r;
+    for (size_t i=0; i<urls.size(); i++) {
+        HttpResult t = HttpGet(urls[i]);
+        if (t.ok) return t;
+        r.err = t.err + L" [" + urls[i] + L"]";
+    }
+    return r;
+}
 static bool WriteFileW(const std::wstring& path, const std::vector<BYTE>& data) {
     size_t sl = path.find_last_of(L"\\/");
     if (sl != std::wstring::npos) MakeDirRecursive(path.substr(0,sl));
@@ -277,6 +287,7 @@ static void SwitchPage(int page) {
     ShowWindow(g_hBtnOpen,        inst?SW_SHOW:SW_HIDE);
     ShowWindow(g_hBtnDel,         inst?SW_SHOW:SW_HIDE);
     ShowWindow(g_hBtnRefreshInst, inst?SW_SHOW:SW_HIDE);
+    ShowWindow(g_hBtnRename,      inst?SW_SHOW:SW_HIDE);
     ShowWindow(g_hAboutText, ab?SW_SHOW:SW_HIDE);
     if (page==1) RefreshInstanceList();
 }
@@ -425,8 +436,14 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                         std::string grp = name.substr(0,p1);
                         std::string art = name.substr(p1+1,p2-p1-1);
                         std::string ver = name.substr(p2+1);
+                        std::string classifier;
+                        size_t pc = ver.find(':');
+                        if (pc != std::string::npos) { classifier = ver.substr(pc+1); ver = ver.substr(0,pc); }
                         for (auto& c : grp) if (c=='.') c='/';
-                        path = grp+"/"+art+"/"+ver+"/"+art+"-"+ver+".jar";
+                        std::string file = art+"-"+ver;
+                        if (!classifier.empty()) file += "-"+classifier;
+                        file += ".jar";
+                        path = grp+"/"+art+"/"+ver+"/"+file;
                     }
                     // fabric libs: net.fabricmc -> fabricmc maven, rest -> Maven Central
                     std::wstring base = L"https://maven.fabricmc.net/";
@@ -479,21 +496,32 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
             std::wstring forgeVer = Utf8ToW(chosen.value("version",""));
             if (forgeVer.empty()) { outErr=L"解析加载器版本失败"; return false; }
 
-            std::wstring instUrl;
+            std::vector<std::wstring> instUrls;
+            std::wstring instMain;
             if (loaderSel == 2) {
-                // Forge: use BMCLAPI maven (WinHTTP now follows redirects manually)
-                instUrl = L"https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/"
+                std::wstring rel = L"net/minecraftforge/forge/"
                     + mcVer + L"-" + forgeVer + L"/forge-" + mcVer + L"-" + forgeVer + L"-installer.jar";
+                instUrls.push_back(L"https://bmclapi2.bangbang93.com/maven/"+rel);
+                instUrls.push_back(L"https://bmclapi.bangbang93.com/maven/"+rel);
+                instUrls.push_back(L"https://maven.minecraftforge.net/"+rel);
+                instMain = instUrls[0];
             } else {
-                // NeoForge: use installerPath from API
+                // NeoForge: use installerPath from API (path already includes /maven)
                 std::string ipath = chosen.value("installerPath", "");
                 if (ipath.empty()) { outErr=L"NeoForge 无 installer 路径"; return false; }
-                instUrl = L"https://bmclapi2.bangbang93.com" + Utf8ToW(ipath);
+                std::wstring wp = Utf8ToW(ipath);
+                instUrls.push_back(L"https://bmclapi2.bangbang93.com"+wp);
+                instUrls.push_back(L"https://bmclapi.bangbang93.com"+wp);
+                // official fallback: strip leading /maven, host neoforged releases maven
+                std::wstring off = wp;
+                if (off.rfind(L"/maven",0)==0) off = off.substr(6);
+                instUrls.push_back(L"https://maven.neoforged.net/releases"+off);
+                instMain = instUrls[0];
             }
             SetStatus(L"下载加载器安装包 "+forgeVer+L"…");
-            outErr = L"URL: " + instUrl;  // debug
-            HttpResult jr = HttpGet(instUrl);
-            if (!jr.ok) { outErr=L"下载安装包失败: "+jr.err+L"  URL:"+instUrl; return false; }
+            outErr = L"URL: " + instMain;  // debug
+            HttpResult jr = HttpGetMulti(instUrls);
+            if (!jr.ok) { outErr=L"下载安装包失败: "+jr.err; return false; }
 
             std::wstring tmpZip = GetExeDir()+L"\\_forge_installer.jar";
             std::wstring tmpDir = GetExeDir()+L"\\_forge_tmp";
@@ -538,16 +566,32 @@ static bool InstallLoader(const std::wstring& mcVer, int loaderSel, const std::w
                     std::string grp = name.substr(0,p1);
                     std::string art = name.substr(p1+1,p2-p1-1);
                     std::string ver = name.substr(p2+1);
+                    // optional classifier: version:classifier
+                    std::string classifier;
+                    size_t pc = ver.find(':');
+                    if (pc != std::string::npos) { classifier = ver.substr(pc+1); ver = ver.substr(0,pc); }
                     std::string path = grp;
                     for (auto& c : path) if (c=='.') c='/';
-                    path += "/"+art+"/"+ver+"/"+art+"-"+ver+".jar";
+                    std::string file = art+"-"+ver;
+                    if (!classifier.empty()) file += "-"+classifier;
+                    file += ".jar";
+                    path += "/"+art+"/"+ver+"/"+file;
                     std::wstring wpath = Utf8ToW(path);
                     std::replace(wpath.begin(), wpath.end(), L'/', L'\\');
                     if (GetFileAttributesW((workDir+L"\\libraries\\"+wpath).c_str()) != INVALID_FILE_ATTRIBUTES) continue;
                     SetStatus(L"[Forge libs "+std::to_wstring(done)+L"/"+std::to_wstring(total)+L"] "+wpath);
-                    // all libraries via BMCLAPI maven (no external maven)
-                    std::wstring url = L"https://bmclapi2.bangbang93.com/maven/" + Utf8ToW(path);
-                    HttpResult d = HttpGet(url);
+                    std::wstring wp = Utf8ToW(path);
+                    std::vector<std::wstring> urls;
+                    urls.push_back(L"https://bmclapi2.bangbang93.com/maven/"+wp);
+                    urls.push_back(L"https://bmclapi.bangbang93.com/maven/"+wp);
+                    // official maven fallback by group
+                    if (grp.rfind("net.neoforged",0)==0)
+                        urls.push_back(L"https://maven.neoforged.net/releases/"+wp);
+                    else if (grp.rfind("net.minecraftforge",0)==0 || grp.rfind("cpw.mods",0)==0)
+                        urls.push_back(L"https://maven.minecraftforge.net/"+wp);
+                    else
+                        urls.push_back(L"https://repo1.maven.org/maven2/"+wp);
+                    HttpResult d = HttpGetMulti(urls);
                     if (d.ok) WriteFileW(workDir+L"\\libraries\\"+wpath, d.data);
                 }
             }
@@ -946,7 +990,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 120, 490, 110, 30, hWnd, (HMENU)ID_BTN_OPENFOLDER, g_hInst, NULL);
         g_hBtnDel = CreateWindowExW(0, L"BUTTON", L"删除实例",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 240, 490, 100, 30, hWnd, (HMENU)ID_BTN_DELINST, g_hInst, NULL);
-        CreateWindowExW(0, L"BUTTON", L"重命名",
+        g_hBtnRename = CreateWindowExW(0, L"BUTTON", L"重命名",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 350, 490, 90, 30, hWnd, (HMENU)ID_BTN_RENAME, g_hInst, NULL);
 
         // === About page ===
@@ -1008,6 +1052,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(g_hBtnRefreshInst, rx, ch-65, 90, 30, TRUE);
         MoveWindow(g_hBtnOpen, rx+100, ch-65, 110, 30, TRUE);
         MoveWindow(g_hBtnDel, rx+220, ch-65, 100, 30, TRUE);
+        MoveWindow(g_hBtnRename, rx+330, ch-65, 90, 30, TRUE);
 
         MoveWindow(g_hAboutText, rx+20, 40, rw-20, ch-60, TRUE);
         // resize last list column to fill
